@@ -1,0 +1,38 @@
+name: CI
+
+# WHEN to run: every push to main, and every pull request into main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality-checks:
+    # GitHub gives us a free, fresh Linux machine for every single run.
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Download our code onto that fresh machine.
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # 2. Install Python on it.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 3. Install our dependencies from requirements.txt.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # 4. Lint: does the code meet our style rules?
+      - name: Lint with ruff
+        run: python -m ruff check .
+
+      # 5. Test: does the code actually work?
+      - name: Run tests
+        run: python -m pytest tests/ -v

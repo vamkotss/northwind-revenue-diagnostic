@@ -1,0 +1,27 @@
+# Virtual environment - never commit; it is 500MB of machine-specific binaries
+.venv/
+venv/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Data - regenerate it, do not commit it
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.duckdb
+
+# Secrets - NEVER commit these
+.env
+*.key
+
+# Editors and OS junk
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Notebook checkpoints
+.ipynb_checkpoints/

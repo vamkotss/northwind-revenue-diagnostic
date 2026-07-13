@@ -1,0 +1,320 @@
+# =============================================================================
+# NORTHWIND METRICS - GOVERNED METRIC DEFINITIONS
+# =============================================================================
+#
+# WHAT THIS FILE IS
+# -----------------
+# The single source of truth for what every metric MEANS at Northwind.
+# Not documentation. Policy. The code reads this file; the code does not have
+# its own opinions. Change a number here and the dashboards change.
+#
+# WHY IT EXISTS
+# -------------
+# Northwind reported three different churn numbers to the board because Sales,
+# Finance, and Product each built a dashboard without writing down what churn
+# meant. Every one of them was internally consistent. Every one of them was
+# useless for making a decision. Nobody was lying; nobody had agreed.
+#
+# This file is what ends that argument. It is signed off BEFORE analysis runs,
+# not written up afterwards to justify a number somebody liked.
+#
+# THE RULE
+# --------
+# If a metric is not defined here, it does not get reported. If an edge case is
+# not ruled on here, the analysis stops until it is.
+#
+# =============================================================================
+
+version: "1.0"
+effective_date: "2026-07-13"
+owner: "Data Analyst (Sri Vamsi Kota)"
+status: "Proposed - pending sign-off by CFO, VP Sales, VP Product"
+
+# -----------------------------------------------------------------------------
+# PARAMETERS
+#
+# These are the knobs. Every one is a JUDGEMENT CALL, and every one is defended
+# below in the `rulings` section with the evidence that produced it.
+#
+# They are here, at the top, in one place, on purpose: so that anyone can see
+# in ten seconds exactly which choices this company's numbers depend on.
+# -----------------------------------------------------------------------------
+parameters:
+
+  # A paused subscription becomes churn after this many days.
+  # DERIVED, not chosen. See ruling R1.
+  pause_grace_days: 60
+
+  # Are usage-based add-on charges part of MRR?
+  # See ruling R2.
+  addons_count_as_mrr: false
+
+  # A cancelled customer who returns within this window is the SAME logo,
+  # not a new one. See ruling R4.
+  winback_window_days: 90
+
+  # Which month does a refund reduce revenue in: the month it was ISSUED,
+  # or the month of the original invoice? See ruling R5.
+  refund_attribution: "original_invoice_month"
+
+  # When a retroactive correction restates a past period, do we restate the
+  # historical number or hold the line? See ruling R6.
+  restate_history_on_correction: true
+
+  # Currency. Everything is USD; no FX conversion in scope.
+  currency: "USD"
+
+
+# -----------------------------------------------------------------------------
+# METRIC DEFINITIONS
+#
+# Each metric states, in order:
+#   definition   - one sentence, in plain English, that a CFO would accept
+#   formula      - the arithmetic, unambiguously
+#   grain        - what one row of the output represents
+#   excludes     - what is deliberately NOT counted (the part people forget)
+#   depends_on   - which parameters change this number if you change them
+# -----------------------------------------------------------------------------
+metrics:
+
+  mrr:
+    definition: >
+      Monthly Recurring Revenue: the contracted subscription revenue we expect
+      to bill a customer every month, at a point in time. Predictable money
+      only - if it swings, it is not recurring.
+    formula: "SUM(subscription.mrr) for all subscriptions active on the date"
+    grain: "one row per customer per month"
+    excludes:
+      - "usage add-on charges (see R2) - variable, therefore not recurring"
+      - "one-time fees, setup fees, professional services"
+      - "refunds and credits (these adjust billed revenue, not contracted MRR)"
+    depends_on: ["addons_count_as_mrr"]
+
+  arr:
+    definition: "Annual Recurring Revenue. MRR multiplied by twelve. Nothing more."
+    formula: "mrr * 12"
+    grain: "one row per customer per month"
+    excludes: ["everything MRR excludes"]
+    depends_on: ["addons_count_as_mrr"]
+
+  addon_revenue:
+    definition: >
+      Usage-based overage revenue, tracked SEPARATELY from MRR precisely
+      because it is volatile. Reported alongside MRR, never inside it.
+    formula: "SUM(invoice.addon_amount) for invoices issued in the month"
+    grain: "one row per customer per month"
+    excludes: ["base subscription charges"]
+    depends_on: ["addons_count_as_mrr"]
+
+  logo_churn:
+    definition: >
+      A customer who stopped being a customer during the period. Counted in
+      customers, not dollars. This is the number Sales cares about.
+    formula: "COUNT(customers who were active at period start and are not active at period end)"
+    grain: "one row per month"
+    excludes:
+      - "downgrades - a downgraded customer is still a customer (see R3)"
+      - "pauses shorter than pause_grace_days (see R1)"
+    depends_on: ["pause_grace_days", "winback_window_days"]
+
+  revenue_churn:
+    definition: >
+      MRR lost from customers who left entirely, as a share of the MRR we had
+      at the start of the period. Counted in dollars. This is the number
+      Finance cares about - and it is a DIFFERENT number from logo churn,
+      legitimately, because a churned Starter customer and a churned
+      Enterprise customer are not the same event.
+    formula: "SUM(mrr of churned customers) / SUM(mrr at period start)"
+    grain: "one row per month"
+    excludes:
+      - "contraction from downgrades - that is a separate line (see R3)"
+    depends_on: ["pause_grace_days", "addons_count_as_mrr"]
+
+  contraction:
+    definition: >
+      MRR lost from customers who are STILL CUSTOMERS but now pay less -
+      through downgrades or seat reductions. Not churn. A different disease
+      with a different cure.
+    formula: "SUM(mrr_start - mrr_end) for retained customers where mrr_end < mrr_start"
+    grain: "one row per month"
+    excludes: ["customers who left entirely - that is revenue_churn"]
+    depends_on: ["addons_count_as_mrr"]
+
+  expansion:
+    definition: >
+      MRR gained from EXISTING customers paying more - upgrades, seat
+      additions. Excludes new customers entirely; new logos are acquisition,
+      not expansion, and conflating them hides a dying upsell motion.
+    formula: "SUM(mrr_end - mrr_start) for retained customers where mrr_end > mrr_start"
+    grain: "one row per month"
+    excludes: ["revenue from customers who signed up during the period"]
+    depends_on: ["addons_count_as_mrr"]
+
+  gross_revenue_retention:
+    definition: >
+      GRR. Of the MRR we had from a cohort a year ago, how much do we still
+      have - counting only the ways we can LOSE money. Expansion is ignored.
+      GRR can never exceed 100%; it is the honest floor.
+    formula: "(starting_mrr - revenue_churn - contraction) / starting_mrr"
+    grain: "one row per month"
+    excludes: ["expansion - deliberately, that is the whole point of GRR"]
+    depends_on: ["pause_grace_days", "addons_count_as_mrr"]
+
+  net_revenue_retention:
+    definition: >
+      NRR. Of the MRR we had from a cohort a year ago, how much do we have
+      now, INCLUDING money they added. Above 100% means the customers we kept
+      grew. Below 100% means they shrank. This is the number the CFO asked
+      about, and the number that fell from 108% to 94%.
+    formula: "(starting_mrr - revenue_churn - contraction + expansion) / starting_mrr"
+    grain: "one row per month"
+    excludes:
+      - "customers who did not exist twelve months ago - NRR is a cohort metric"
+    depends_on: ["pause_grace_days", "addons_count_as_mrr"]
+
+
+# -----------------------------------------------------------------------------
+# EDGE-CASE RULINGS
+#
+# The hard part. Each ruling states the question, the decision, the EVIDENCE,
+# and - critically - what we gave up by deciding this way.
+#
+# There is no correct answer to any of these. There is only a defensible one,
+# consistently applied, written down before the analysis rather than after.
+# -----------------------------------------------------------------------------
+rulings:
+
+  - id: R1
+    question: "A customer pauses their subscription. Are they churned?"
+    ruling: "Churned once the pause exceeds 60 days. Before that, still a customer."
+    evidence: >
+      Derived from the data, not chosen. Plotting return rate against pause
+      length across 612 paused subscriptions: 58.5% of all returns happen
+      within 30 days, 89.6% within 60 days, 99.4% within 90 days. Beyond two
+      months the monthly return rate collapses below 2% and the curve is flat.
+      60 days is where the elbow is. See notebooks/pause_curve.py.
+    rejected_alternatives:
+      - "Churn immediately (Sales position). Rejected: 27% of paused customers
+         return, and most within a month. Counting them as churned inflates BOTH
+         churn and new-logo acquisition. It is double-lying."
+      - "Never churn until they formally cancel (Finance position). Rejected:
+         some 'paused' customers cancelled months ago and nobody updated the CRM.
+         This is churn-in-denial and it is how a company fools itself for a year."
+    cost_of_this_choice: >
+      Customers who return after 61-90 days (about 10% of returns) will be
+      counted as churned and then as a new logo. We accept that error because
+      the alternative errors are larger and less honest.
+    affects: ["logo_churn", "revenue_churn", "net_revenue_retention"]
+
+  - id: R2
+    question: "Are usage-based add-on charges part of MRR?"
+    ruling: "No. Tracked separately as addon_revenue."
+    evidence: >
+      Add-on charges swing month to month with usage - they are not
+      predictable, and 'recurring' means predictable. Including them makes MRR
+      a number Finance cannot build a plan on. The Sept 2025 price increase on
+      add-on rates raised add-on revenue by roughly 45% overnight; folding that
+      into MRR would have made retention look artificially healthy at exactly
+      the moment it was collapsing.
+    rejected_alternatives:
+      - "Include add-ons in MRR. Rejected: it inflates MRR, hides pricing
+         effects inside a retention number, and would have masked the very
+         trend the CFO is asking about."
+    cost_of_this_choice: >
+      Our MRR is lower than a competitor who counts add-ons, so benchmarks are
+      not directly comparable. We state the definition alongside every
+      external number to make that explicit.
+    affects: ["mrr", "arr", "addon_revenue", "net_revenue_retention"]
+
+  - id: R3
+    question: "A customer downgrades from Growth to Starter. Is that churn?"
+    ruling: "No. That is CONTRACTION. They are still a customer."
+    evidence: >
+      A downgraded customer still pays us, still uses the product, and can be
+      won back with a product or pricing response. A churned customer cannot.
+      Collapsing the two into one number destroys the information needed to
+      choose a response - and in this dataset, contraction is the LARGEST
+      driver of the NRR decline. Counting it as churn would have buried the
+      finding.
+    rejected_alternatives:
+      - "Count downgrades as partial churn. Rejected: it inflates the churn
+         number and, worse, it makes churn and contraction indistinguishable
+         in the output - so nobody can tell which problem to fix."
+    cost_of_this_choice: >
+      Logo churn will look low relative to the revenue damage. We therefore
+      never report logo churn alone; it is always reported next to contraction.
+    affects: ["logo_churn", "revenue_churn", "contraction"]
+
+  - id: R4
+    question: "A cancelled customer resubscribes. New logo, or the same one?"
+    ruling: >
+      Same logo if they return within 90 days ('winback'). A new logo after
+      that. Winbacks are reported as a separate line, never netted silently
+      against churn.
+    evidence: >
+      PRECAUTIONARY, NOT OBSERVED. Zero of the 933 hard cancellations in this
+      dataset ever resubscribed. The rule is written to govern future data,
+      and this note exists so that nobody later mistakes it for a finding.
+      This is deliberate: the honest response to an edge case with no evidence
+      is to say so, not to invent evidence for it.
+    rejected_alternatives:
+      - "Always a new logo. Rejected: it flatters the acquisition number by
+         counting the same company twice."
+      - "Always the same logo. Rejected: a customer returning after two years
+         is a genuinely new sale and the sales team earned it."
+    cost_of_this_choice: >
+      The 90-day window is arbitrary until we have winback data to calibrate
+      it against. Flagged for revision once such data exists.
+    affects: ["logo_churn"]
+
+  - id: R5
+    question: "A refund arrives 40 days after the invoice. Which month loses it?"
+    ruling: "The ORIGINAL invoice month. History is restated."
+    evidence: >
+      613 refund rows exist (1.2% of invoices), issued 10-60 days after the
+      original. Attributing them to the issue month would push revenue losses
+      into a month where the underlying sale never happened, systematically
+      overstating recent months and understating the past. Since refunds cluster
+      after the Sept 2025 price rise, that error would have masked the damage.
+    rejected_alternatives:
+      - "Attribute to the month the refund was issued. Simpler, and it is what
+         the cash statement does. Rejected because it makes trend analysis
+         meaningless, which is the entire task here."
+    cost_of_this_choice: >
+      Reported revenue for a closed month can change after the fact. Every
+      report carries an 'as of' date, and any restatement is logged.
+    affects: ["revenue_churn", "addon_revenue"]
+
+  - id: R6
+    question: "Finance backdates a plan change. Do we restate the past?"
+    ruling: "Yes. The correction supersedes the original. History is restated."
+    evidence: >
+      103 correction rows exist, each overlapping a period that already has a
+      subscription row, each restating MRR DOWNWARD (median $511 vs $659
+      original). Summing both rows naively double-counts revenue - which is one
+      concrete reason the analytics tables do not tie to the billing ledger.
+      Ignoring corrections leaves a known-wrong number in the report.
+    rejected_alternatives:
+      - "Hold the line - report what was known at the time. Defensible for
+         audit purposes. Rejected here because the CFO is asking a diagnostic
+         question about what actually happened, not a compliance question about
+         what we believed."
+      - "Sum both rows. Rejected: this is simply a bug. It double-counts."
+    cost_of_this_choice: >
+      Historical numbers move. Every published figure carries the metrics
+      version and an 'as of' date so any two reports can be reconciled.
+    affects: ["mrr", "revenue_churn", "contraction", "net_revenue_retention"]
+
+
+# -----------------------------------------------------------------------------
+# WHAT WE ARE NOT MEASURING
+#
+# Stating this explicitly is part of the contract. An undefined metric that
+# people quietly compute anyway is exactly how you end up with three churn
+# numbers again.
+# -----------------------------------------------------------------------------
+out_of_scope:
+  - "CAC, LTV, payback period - no cost data in scope"
+  - "Multi-currency / FX - everything is USD"
+  - "Bookings vs. billings vs. revenue recognition - not a GAAP exercise"
+  - "Product-qualified lead scoring - no marketing data in scope"

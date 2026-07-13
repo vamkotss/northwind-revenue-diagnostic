@@ -476,11 +476,20 @@ def build_invoices(subs: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame
 
     df = pd.DataFrame(rows)
 
+    # Every real invoice is its own document; it reverses nothing.
+    df["reverses_invoice_id"] = None
+
     # Refunds: recorded as NEGATIVE invoices, arriving weeks after the original.
     # Finance nets these; analytics teams routinely forget to. Real trap.
+    #
+    # Crucially, a refund CARRIES A REFERENCE to the invoice it reverses -
+    # exactly as a real credit note does. Without that reference, ruling R5
+    # ("attribute the refund to the ORIGINAL invoice month") would be
+    # unimplementable, and we would be shipping a rule the code cannot honour.
     n_refunds = int(len(df) * 0.012)
     refund_src = df.sample(n=n_refunds, random_state=int(rng.integers(0, 10**6)))
     refunds = refund_src.copy()
+    refunds["reverses_invoice_id"] = refund_src["invoice_id"].to_numpy()
     refunds["invoice_id"] = [f"INV-R{i:06d}" for i in range(1, n_refunds + 1)]
     refunds["amount"] = -refunds["amount"].abs()
     refunds["base_amount"] = -refunds["base_amount"].abs()

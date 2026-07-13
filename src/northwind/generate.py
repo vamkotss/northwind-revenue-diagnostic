@@ -561,28 +561,51 @@ def build_usage(subs: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
 
 
 def build_experiment(customers: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
-    """The Q1 2026 pricing experiment - deliberately broken in two ways.
+    """The Q1 2026 pricing experiment - broken in two ways, on purpose.
 
-    DEFECT A: SAMPLE RATIO MISMATCH (SRM). The split was meant to be 50/50 but
-    lands near 55/45. An SRM means the randomisation itself failed, which means
-    the two groups are not comparable and the naive readout is worthless.
+    THE EXPERIMENT
+    A retention offer: treatment customers were shown a discounted renewal.
+    The question the VP wants answered is "did it reduce churn?"
 
-    DEFECT B: CONTAMINATION. A subset of customers appear in BOTH arms - they
-    were re-randomised mid-experiment after a deploy. Their outcomes are
-    unusable and must be excluded before any readout.
+    DEFECT A: SAMPLE RATIO MISMATCH, WITH A CAUSE.
+    The split was meant to be 50/50 and lands near 55/45. But an SRM is a
+    SYMPTOM, not a disease. The disease is that the assignment code bucketed on
+    a field that correlates with customer size - so SMB customers were pushed
+    disproportionately into control, and Enterprise customers into treatment.
 
-    Detecting both, and producing a defensible answer anyway, is the milestone.
+    This is what makes an SRM lethal rather than merely untidy. The two arms are
+    no longer comparable. Enterprise customers churn far less than SMB ones - so
+    treatment will LOOK like it worked, brilliantly, even though the true effect
+    is zero. An analyst who checks the p-value and not the split will ship a
+    finding that is exactly backwards.
+
+    DEFECT B: CONTAMINATION.
+    A deploy mid-experiment re-randomised ~4% of customers, so they appear in
+    BOTH arms. Their outcomes are unusable and must be excluded before any
+    readout.
+
+    THE TRUE TREATMENT EFFECT IS ZERO. The discount did nothing. Everything the
+    naive analysis will find is selection bias.
     """
     exp_start = date(2026, 1, 15)
 
-    # Eligible: signed up before the experiment and on Starter or Growth.
     eligible = customers[customers["signup_date"] < exp_start].copy()
     eligible = eligible.sample(frac=0.45, random_state=int(rng.integers(0, 10**6)))
 
     n = len(eligible)
 
-    # DEFECT A: the split is 55/45, not the intended 50/50.
-    arms = rng.choice(["control", "treatment"], size=n, p=[0.55, 0.45])
+    # DEFECT A: the assignment probability DEPENDS ON SEGMENT. This is the bug.
+    # A correct experiment would use a constant 0.50 here for everyone.
+    control_prob = {
+        "SMB": 0.62,          # small customers pushed toward control
+        "Mid-Market": 0.50,
+        "Enterprise": 0.35,   # large customers pushed toward treatment
+    }
+
+    arms = []
+    for segment in eligible["segment"]:
+        p_control = control_prob.get(segment, 0.50)
+        arms.append("control" if rng.random() < p_control else "treatment")
 
     df = pd.DataFrame(
         {

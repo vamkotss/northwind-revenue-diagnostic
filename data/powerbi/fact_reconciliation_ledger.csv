@@ -1,0 +1,6 @@
+line,rows,dollars
+Raw invoice rows (as exported by billing),51587,174532024.69
+  less: duplicates removed,-306,-1192238.1199999999
+  less: orphans quarantined,-154,-536505.67
+= Clean invoice rows,51127,172803280.9
+UNEXPLAINED RESIDUAL,0,0.0

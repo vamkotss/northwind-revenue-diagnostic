@@ -25,3 +25,6 @@ Thumbs.db
 
 # Notebook checkpoints
 .ipynb_checkpoints/
+
+# Power BI export - regenerable from the pipeline
+data/powerbi/

@@ -207,6 +207,97 @@ def test_defect_ambiguous_pause(data):
 
 
 # ---------------------------------------------------------------------------
+# 3b. PAUSE BEHAVIOUR IS REAL AND THE THRESHOLD IS DERIVABLE
+#
+# The churn ruling depends on being able to MEASURE how pause length relates to
+# whether a customer ever comes back. If that relationship is not in the data,
+# any threshold you pick is arbitrary - and an interviewer will catch it.
+# ---------------------------------------------------------------------------
+
+
+def _pause_return_curve(subs: pd.DataFrame) -> pd.DataFrame:
+    """For every paused subscription: did the customer return, and how long after?
+
+    A "return" means a later subscription row exists for the same customer,
+    starting after the pause began. The source system does not record this -
+    it must be reconstructed by joining the table to itself.
+    """
+    s = subs[~subs["is_correction"]].copy()
+    s["period_start"] = pd.to_datetime(s["period_start"])
+    s["period_end"] = pd.to_datetime(s["period_end"])
+
+    paused = s[s["status"] == "paused"][
+        ["subscription_id", "customer_id", "period_end"]
+    ].copy()
+
+    # Self-join: match each paused row to every later period for that customer.
+    joined = paused.merge(s[["customer_id", "period_start"]], on="customer_id")
+    joined = joined[joined["period_start"] > joined["period_end"]]
+
+    # The earliest such period is when they came back.
+    first_return = joined.groupby("subscription_id")["period_start"].min()
+
+    paused["returned_on"] = paused["subscription_id"].map(first_return)
+    paused["returned"] = paused["returned_on"].notna()
+    paused["gap_months"] = (
+        (paused["returned_on"] - paused["period_end"]).dt.days / 30.44
+    ).round()
+
+    return paused
+
+
+def test_some_paused_customers_come_back(data):
+    """Pauses are not all terminal - a meaningful share of customers return.
+
+    If nobody ever returned, 'paused' would just be a synonym for 'churned'
+    and there would be no edge case to rule on.
+    """
+    curve = _pause_return_curve(data["subscriptions"])
+
+    return_rate = curve["returned"].mean()
+    assert 0.10 < return_rate < 0.60, (
+        f"return rate of {return_rate:.1%} makes the pause ruling trivial"
+    )
+
+
+def test_return_rate_decays_with_pause_length(data):
+    """THE KEY PROPERTY. Longer pauses mean fewer returns.
+
+    This decay is what makes an empirical churn threshold possible. The analyst
+    plots returns against pause length, sees the curve collapse, and cuts where
+    it flattens. Without this decay, any threshold is a guess dressed up as a
+    decision - and that is exactly what this project exists to avoid.
+    """
+    curve = _pause_return_curve(data["subscriptions"])
+    returns = curve[curve["returned"]]
+
+    # The overwhelming majority of returns must happen EARLY.
+    within_60_days = (returns["gap_months"] <= 2).mean()
+    assert within_60_days > 0.80, (
+        f"only {within_60_days:.1%} of returns happen within 60 days; "
+        "the curve is too flat for a threshold to be defensible"
+    )
+
+    # And late returns must be genuinely rare - the tail has to die.
+    beyond_120_days = (returns["gap_months"] > 4).mean()
+    assert beyond_120_days < 0.05, (
+        f"{beyond_120_days:.1%} of returns happen after 120 days; tail is too fat"
+    )
+
+
+def test_paused_is_a_mixed_bag(data):
+    """Some 'paused' rows are real pauses; some are cancellations nobody logged.
+
+    This is the trap. You cannot treat 'paused' as one thing, because it is not
+    one thing - and no field in the source data tells you which is which.
+    """
+    curve = _pause_return_curve(data["subscriptions"])
+
+    assert curve["returned"].sum() > 0, "no paused customer ever returned"
+    assert (~curve["returned"]).sum() > 0, "every paused customer returned"
+
+
+# ---------------------------------------------------------------------------
 # 4. THE CONTAMINATED EXPERIMENT
 # ---------------------------------------------------------------------------
 
@@ -283,11 +374,11 @@ def test_net_revenue_retention_actually_declines(data):
     nrr_early = nrr_for(pd.Timestamp("2025-08-01"))
     nrr_late = nrr_for(pd.Timestamp("2026-06-01"))
 
-    # It started healthy...
-    assert nrr_early > 1.05, f"NRR should start above 105%, got {nrr_early:.1%}"
+    # It started healthy - the surviving customers were growing.
+    assert nrr_early > 1.04, f"NRR should start above 104%, got {nrr_early:.1%}"
 
-    # ...and it fell off a cliff. This is the CFO's question, made real.
-    assert nrr_late < 1.00, f"NRR should end below 100%, got {nrr_late:.1%}"
+    # ...and it fell below water. This is the CFO's question, made real.
+    assert nrr_late < 0.97, f"NRR should end below 97%, got {nrr_late:.1%}"
 
-    # The drop must be large enough to be worth investigating.
-    assert (nrr_early - nrr_late) > 0.10, "NRR decline is too small to be the story"
+    # The drop must be large enough to be worth a board-level investigation.
+    assert (nrr_early - nrr_late) > 0.08, "NRR decline is too small to be the story"

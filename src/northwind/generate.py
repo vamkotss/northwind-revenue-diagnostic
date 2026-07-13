@@ -84,6 +84,31 @@ PRICE_RISE_DATE = date(2025, 9, 1)      # usage add-on rates increased
 COMPETITOR_DATE = date(2025, 10, 1)     # competitor launches; downgrades begin
 SALES_REORG_DATE = date(2025, 7, 1)     # expansion motion breaks
 
+# ---------------------------------------------------------------------------
+# PAUSE BEHAVIOUR
+#
+# This is the crux of the whole project, so it is modelled honestly rather than
+# asserted. Customers pause for a while and then either come back or do not.
+#
+# The KEY property: the longer someone stays paused, the less likely they ever
+# return. That decay is what makes an empirical churn threshold derivable. The
+# analyst is meant to plot return rate against pause length, find where the
+# curve flattens, and cut there - instead of picking a round number because it
+# sounds sensible.
+#
+# With the numbers below, roughly 88% of all returns happen within 60 days, and
+# beyond that the monthly return rate collapses under 2%. That is the finding.
+# It is planted, but it is not given away: nothing in the data says "60 days".
+# ---------------------------------------------------------------------------
+
+# Monthly probability that an active customer pauses rather than churning.
+PAUSE_HAZARD = {"Starter": 0.010, "Growth": 0.008, "Enterprise": 0.005}
+
+# How long pauses last, in months, and how likely a return is at each length.
+PAUSE_MONTHS = [1, 2, 3, 4, 5, 6]
+PAUSE_MONTH_WEIGHTS = [0.35, 0.25, 0.15, 0.10, 0.08, 0.07]
+RESURRECTION_PROB = {1: 0.80, 2: 0.62, 3: 0.28, 4: 0.12, 5: 0.06, 6: 0.03}
+
 # Defect injection rates. These are the numbers the tests assert against.
 DEFECT_RATES = {
     "duplicate_invoices": 0.006,       # 0.6% of invoices get a twin
@@ -179,7 +204,7 @@ def _churn_hazard(current: date, plan: str, segment: str, heavy_user: bool) -> f
     base = {"Starter": 0.022, "Growth": 0.012, "Enterprise": 0.004}[plan]
 
     if current >= PRICE_RISE_DATE and plan == "Starter" and heavy_user:
-        base *= 3.2          # the price rise drove them out
+        base *= 2.4          # the price rise drove them out
 
     if segment == "SMB":
         base *= 1.25         # small companies always churn more
@@ -196,7 +221,7 @@ def _downgrade_hazard(current: date, plan: str, segment: str) -> float:
     if current < COMPETITOR_DATE:
         return 0.003
     if plan == "Growth" and segment == "SMB":
-        return 0.055         # the competitor's sweet spot
+        return 0.038         # the competitor's sweet spot
     if plan == "Growth":
         return 0.018
     if plan == "Enterprise":
@@ -212,10 +237,10 @@ def _expansion_hazard(current: date, plan: str) -> float:
     disappear from a churn report, it just stops showing up, and NRR falls.
     """
     if plan == "Enterprise":
-        return 0.030 if current < SALES_REORG_DATE else 0.006
+        return 0.052 if current < SALES_REORG_DATE else 0.011
     if plan == "Growth":
-        return 0.022 if current < SALES_REORG_DATE else 0.012
-    return 0.015             # Starter -> Growth, largely self-serve, unaffected
+        return 0.040 if current < SALES_REORG_DATE else 0.015
+    return 0.024             # Starter -> Growth, largely self-serve, unaffected
 
 
 def build_subscriptions(customers: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
@@ -262,6 +287,9 @@ def build_subscriptions(customers: pd.DataFrame, rng: np.random.Generator) -> pd
             expanded = (not churned and not downgraded) and (
                 rng.random() < _expansion_hazard(current, plan)
             )
+            paused = (not churned and not downgraded and not expanded) and (
+                rng.random() < PAUSE_HAZARD[plan]
+            )
 
             if churned:
                 sub_counter += 1
@@ -299,6 +327,46 @@ def build_subscriptions(customers: pd.DataFrame, rng: np.random.Generator) -> pd
                 plan = "Growth" if plan == "Enterprise" else "Starter"
                 seats = max(1, int(seats * 0.5))
                 period_start = next_month
+
+            elif paused:
+                # Close the current period with status 'paused'. Note what the
+                # source system does NOT record: whether they are coming back.
+                # Nobody knows at the time. That is the whole problem.
+                sub_counter += 1
+                rows.append(
+                    {
+                        "subscription_id": f"SUB-{sub_counter:06d}",
+                        "customer_id": cust.customer_id,
+                        "plan_tier": plan,
+                        "seats": seats,
+                        "mrr": round(PLANS[plan] * (1 + 0.08 * (seats - 1)), 2),
+                        "period_start": period_start,
+                        "period_end": next_month,
+                        "status": "paused",
+                        "is_correction": False,
+                    }
+                )
+
+                # How long the pause lasts, and whether they ever come back.
+                # Return probability DECAYS sharply with duration - that decay
+                # is the signal the analyst must find.
+                months_paused = int(rng.choice(PAUSE_MONTHS, p=PAUSE_MONTH_WEIGHTS))
+                comes_back = rng.random() < RESURRECTION_PROB[months_paused]
+
+                if comes_back:
+                    # They resume, usually with fewer seats than before.
+                    resume = add_months(next_month, months_paused)
+                    if resume >= END_DATE:
+                        alive = False          # pause outlasts our window
+                    else:
+                        seats = max(1, int(seats * rng.uniform(0.6, 1.0)))
+                        period_start = resume
+                        current = resume
+                        continue               # skip the normal month advance
+                else:
+                    # They never return. The source system never marks them
+                    # cancelled - the row just sits there, paused, forever.
+                    alive = False
 
             elif expanded:
                 sub_counter += 1
@@ -639,16 +707,24 @@ def inject_defects(
     log("orphan_invoices", "invoices", n_orphan,
         "customer_id values with no matching row in customers")
 
-    # --- DEFECT 8: ambiguous pauses ---------------------------------------
-    # The status nobody agreed on. Sales counts a pause as churn. Finance does
-    # not. This single field is why the board deck has two churn numbers.
-    active_idx = subs[subs["status"] == "active"].index
-    n_pause = int(len(subs) * DEFECT_RATES["ambiguous_pause"])
-    n_pause = min(n_pause, len(active_idx))
-    pause_idx = rng.choice(active_idx, size=n_pause, replace=False)
-    subs.loc[pause_idx, "status"] = "paused"
-    log("ambiguous_pause", "subscriptions", n_pause,
-        "status='paused': counted as churn by Sales, as active by Finance")
+    # --- DEFECT 8: mislabelled cancellations ------------------------------
+    # Real pauses already exist in the data, with real durations and real
+    # return behaviour. THIS defect is different: some customers who genuinely
+    # CANCELLED were never marked cancelled in the CRM. A rep forgot. So they
+    # sit in the system as 'paused' forever.
+    #
+    # The consequence: 'paused' is now a mixed bag. Some of those customers are
+    # coming back. Some left months ago and are never coming back. The source
+    # system cannot tell you which, and that ambiguity is precisely why Sales
+    # and Finance report different churn numbers - and why the analyst has to
+    # rule on it from evidence rather than opinion.
+    churned_idx = subs[subs["status"] == "churned"].index
+    n_mislabel = int(len(subs) * DEFECT_RATES["ambiguous_pause"])
+    n_mislabel = min(n_mislabel, len(churned_idx))
+    mislabel_idx = rng.choice(churned_idx, size=n_mislabel, replace=False)
+    subs.loc[mislabel_idx, "status"] = "paused"
+    log("ambiguous_pause", "subscriptions", n_mislabel,
+        "true cancellations never marked cancelled; they sit as 'paused' forever")
 
     return customers, subs, invoices, usage, pd.DataFrame(manifest)
 
